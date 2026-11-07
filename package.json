@@ -1,0 +1,11 @@
+{
+  "name": "soundgo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SoundCloud plugin for MyGo Music",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "smoke": "bun scripts/smoke.js"
+  }
+}

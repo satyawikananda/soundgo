@@ -1,0 +1,50 @@
+{
+  "id": "soundgo",
+  "name": "SoundGo",
+  "version": "0.1.0",
+  "minAppVersion": "0.1.8",
+  "main": "index.js",
+  "playback": "stream",
+  "permissions": {
+    "network": [
+      "soundcloud.com",
+      "*.soundcloud.com",
+      "api-v2.soundcloud.com",
+      "api-auth.soundcloud.com",
+      "*.sndcdn.com",
+      "*.soundcloud.cloud",
+      "lrclib.net"
+    ],
+    "process": [
+      "ffmpeg",
+      "/opt/homebrew/bin/ffmpeg",
+      "/usr/local/bin/ffmpeg"
+    ]
+  },
+  "settings": [
+    {
+      "key": "oauthToken",
+      "label": "oauth_token cookie",
+      "help": "Sign in at soundcloud.com, open the browser's developer tools, then copy the oauth_token cookie from Application > Cookies. Paste it here and click Sign In.",
+      "link": "https://soundcloud.com"
+    }
+  ],
+  "navigation": [
+    {
+      "builtin": "home"
+    },
+    {
+      "builtin": "liked"
+    },
+    {
+      "title": "Charts",
+      "page": "charts",
+      "icon": "chart"
+    },
+    {
+      "title": "Following",
+      "page": "following",
+      "icon": "artist"
+    }
+  ]
+}
