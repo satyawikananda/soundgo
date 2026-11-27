@@ -10,24 +10,18 @@ Install in MyGo Music, or add this repository in **Settings > Plugins > +**:
 https://github.com/satyawikananda/soundgo
 ```
 
-Use the plugin ZIP attached to a release for manual installation, not GitHub's source ZIP. The minimum supported MyGo Music version is listed in `plugin.json` as `minAppVersion`.
+Use the platform-specific plugin ZIP attached to a release for manual installation (MyGo Music picks it automatically when installing from GitHub), not GitHub's source ZIP. The minimum supported MyGo Music version is listed in `plugin.json` as `minAppVersion`.
 
-SoundGo plays through [ffmpeg](https://ffmpeg.org). Install it first:
-
-```bash
-brew install ffmpeg
-```
-
-In Settings > Plugins, allow SoundGo to start programs. It starts only `ffmpeg`, from the PATH, `/opt/homebrew/bin` or `/usr/local/bin`.
+Each release ZIP bundles a lightweight HLS helper (`bin/hls-helper`), so **you do not need to install `ffmpeg`**. In Settings > Plugins, allow SoundGo to start `bin/hls-helper*`.
 
 ## Signing in
 
-1. Sign in at [soundcloud.com](https://soundcloud.com) in a browser.
-2. Open the developer tools, then **Application > Cookies > https://soundcloud.com**.
-3. Copy the value of the `oauth_token` cookie.
-4. Paste it in Settings > Plugins > SoundGo, then click **Sign In**.
+1. Click **Sign In** in MyGo Music.
+2. Sign in to your SoundCloud account in the window that opens (supports email, Google, Apple, and Facebook). Once finished, the window closes automatically and captures both `oauth_token` and `oauth_refresh_token`.
 
-The token is kept unencrypted in the plugin's data on this machine and is sent only to SoundCloud. Signing out forgets it. To end the session on SoundCloud's side, sign out in the browser.
+When `oauth_refresh_token` is present, SoundGo automatically rotates the session via `https://secure.soundcloud.com/oauth/token` before expiration and on `401` responses, persisting each new single-use refresh token in plugin storage.
+
+The tokens are kept unencrypted in the plugin's data on this machine and are sent only to SoundCloud. Signing out forgets them. To end the session on SoundCloud's side, sign out in the browser.
 
 The public catalog, search and playback work without signing in.
 
@@ -39,7 +33,7 @@ The public catalog, search and playback work without signing in.
 
 ## How it plays
 
-SoundCloud serves most audio as HLS, which the app cannot decode. The plugin resolves the HLS playlist with the account's session, then ffmpeg turns it into MP3 on the fly and serves it on `127.0.0.1` for the app. Startup takes about a second.
+SoundCloud serves most audio as plain HLS (fMP4 AAC-LC segments). The plugin resolves the HLS playlist with the account's session, then its bundled pure-Go helper (`bin/hls-helper`) unwraps the fMP4/MP3/MPEG-TS segments into continuous ADTS AAC or MP3 audio on `127.0.0.1` without lossy re-encoding.
 
 Some tracks, mostly major-label releases, are encrypted with Widevine or PlayReady. No plugin can play those; they are shown as unavailable.
 
@@ -49,7 +43,7 @@ SoundCloud has no lyrics. The plugin asks [LRCLIB](https://lrclib.net) by title,
 
 ## Privacy
 
-The plugin talks to `soundcloud.com`, `api-v2.soundcloud.com`, `api-auth.soundcloud.com`, `*.sndcdn.com`, `*.soundcloud.cloud` and `lrclib.net`. It reads SoundCloud's public pages to find the current web client id, keeps that id, the session token, cached track metadata and the local listening history in its data folder, and sends nothing anywhere else.
+The plugin talks to `soundcloud.com`, `api-v2.soundcloud.com`, `api-auth.soundcloud.com`, `secure.soundcloud.com`, `*.sndcdn.com`, `*.soundcloud.cloud` and `lrclib.net`. It reads SoundCloud's public pages to find the current web client id, keeps that id, the session tokens, cached track metadata and the local listening history in its data folder, and sends nothing anywhere else.
 
 ## Credits
 

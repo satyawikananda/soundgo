@@ -40,8 +40,9 @@ Two constraints shape the design:
 Permissions in `plugin.json` are explicit:
 
 - Network: `soundcloud.com`, `*.soundcloud.com`, `api-v2.soundcloud.com`,
-  `api-auth.soundcloud.com`, `*.sndcdn.com`, `*.soundcloud.cloud`, `lrclib.net`
-- Process: `ffmpeg`, plus the Homebrew and `/usr/local` paths
+  `api-auth.soundcloud.com`, `secure.soundcloud.com`, `*.sndcdn.com`,
+  `*.soundcloud.cloud`, `lrclib.net`
+- Process: `bin/hls-helper*` (bundled pure-Go HLS helper)
 
 ## Module map
 
@@ -115,21 +116,55 @@ find one rather than failing silently.
 
 ## Authentication and session
 
-Signing in is cookie-based:
+Signing in uses MyGo Music's built-in web sign-in window (`host.webSignIn`) by
+default, with manual cookie pasting kept as a fallback:
 
-1. The listener copies `oauth_token` from their browser and pastes it into the
-   plugin setting.
-2. `signIn` normalises the value. It accepts a bare token, `oauth_token=…`, or a
-   whole Cookie header.
-3. The token is validated with `POST
-   https://api-auth.soundcloud.com/connect/session?client_id=…` and the body
-   `{"session":{"access_token":"…"}}`.
-4. On success the token is stored in `host.storage` and `/me` is fetched.
-5. On failure the storage entry is removed and a `signIn` error is raised.
+1. When the manual settings fields are empty, `signIn` opens
+   `https://secure.soundcloud.com/web-auth` directly at top level with
+   `app_id=3152`, `redirect_uri=https://m.soundcloud.com/signin/callback`, and
+   `state` targeting `https://soundcloud.com/discover` via `host.webSignIn`
+   (`cookiesOf: "https://soundcloud.com/n/api/refresh-token"`,
+   `until: ["oauth_token"]`). Using `app_id=3152` switches SoundCloud's
+   federated providers (Google, Apple, Facebook) from blocked `window.open`
+   popups to same-window redirects, and bouncing onto `soundcloud.com` lets
+   SoundCloud's own web bootstrap mint both `oauth_token` and `HttpOnly`
+   `oauth_refresh_token` cookies.
+2. When the listener fills in `oauthToken` or `oauthRefreshToken` in settings,
+   `signIn` normalises the pasted values (bare tokens, `name=value` pairs, full
+   `Cookie` headers, or DevTools `Copy as cURL` / `Copy as fetch`) and validates
+   via `POST https://api-auth.soundcloud.com/connect/session?client_id=…`. If
+   the pasted `oauth_token` is already expired or omitted while
+   `oauth_refresh_token` is present, `signIn` exchanges the refresh token first.
+3. On success the access token, refresh token (when present), and expiration
+   timestamp (decoded from the JWT `exp` claim or `expires_in`) are stored in
+   `host.storage` and `/me` is fetched.
+4. On failure the storage entries are removed and a `signIn` error is raised.
 
-`setSetting` clears the stored token when `oauthToken` changes, so a new paste
-always starts a new session. `account` returns `null` when there is no token or
-when `/me` rejects it, which makes the app show itself as signed out.
+### Automatic token refresh
+
+SoundCloud's web `oauth_token` is a short-lived JWT (~1 hour) paired with a
+single-use `oauth_refresh_token`:
+
+- **Proactive refresh:** Before authenticated `api()` calls and on a background
+  timer, SoundGo refreshes the token when within 5 minutes of `tokenExpiresAt`
+  (or JWT `exp`).
+- **Reactive refresh:** On a `401` response, `api()` first retries if another
+  in-flight request already rotated the token, then rules out a stale
+  `client_id`, and then refreshes via `POST https://secure.soundcloud.com/oauth/token`
+  (`grant_type=refresh_token`, using the JWT's `client_id` or the scraped web
+  `client_id`).
+- **Single-flight lock & rotation:** Concurrent calls share one refresh promise
+  so a single-use refresh token is never submitted twice. Each successful
+  refresh immediately persists the new `token`, rotated `refreshToken`, and
+  `tokenExpiresAt`.
+- **Failure handling:** Transient network, `429`, or `5xx` errors keep the
+  stored session intact and retry with backoff. Permanent `invalid_grant` /
+  `401` refresh failures clear the session and raise a `signIn` error.
+
+`setSetting` clears the stored session when `oauthToken` changes, and updates
+the stored refresh token in-place when `oauthRefreshToken` changes on an active
+session. `account` returns `null` when there is no session or when `/me` rejects
+it, which makes the app show itself as signed out.
 
 The token is stored unencrypted in the plugin's data folder. It is sent only to
 SoundCloud hosts. This matches the behaviour of other MyGo plugins that depend
@@ -221,8 +256,8 @@ stream({ id })
   -> choose transcoding
   -> GET transcoding.url?client_id=…&track_authorization=…
   -> signed playlist.m3u8
-  -> ffmpeg -i <m3u8> -c:a libmp3lame -f mp3 -listen 1 127.0.0.1:<port>
-  -> { url: "http://127.0.0.1:<port>/", type: "mp3" }
+  -> POST http://127.0.0.1:<helper-port>/register { url }
+  -> { url: "http://127.0.0.1:<helper-port>/stream/<id>", type: "aac" | "mp3" }
 ```
 
 Transcoding choice:
@@ -307,7 +342,9 @@ because English text is the key itself.
 - **No write actions.** Likes, follows, playlist edits and comments are out of
   scope.
 - **No podcasts or stations.**
-- **Token lifetime.** An expired or revoked `oauth_token` requires a new paste.
+- **Token lifetime.** Without `oauth_refresh_token`, an expired `oauth_token`
+  requires a new paste. With `oauth_refresh_token`, sessions refresh
+  automatically until the refresh token itself is revoked or expires.
 
 ## Testing
 
@@ -335,6 +372,4 @@ Manual checks cover the account half:
 The write half is a separate phase: `like`, `isLiked`, `followArtist`,
 `savePlaylist`, `saveAlbum`, playlist create/rename/delete, add/remove tracks
 and comments. The endpoints are known and use the same session, but they need
-careful testing against a real account. A browser sign-in flow
-(`host.webSignIn`) is also possible, but it crashes the Linux build, so pasting
-the cookie remains the supported path.
+careful testing against a real account.

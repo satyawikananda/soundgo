@@ -4,29 +4,47 @@
 // SoundCloud for MyGo Music: the listener's stream, likes, playlists, search,
 // artist pages, charts, lyrics and audio, played from a personal account.
 //
-// Signing in takes the oauth_token cookie of a browser session, pasted into the
-// plugin's settings. The public catalog works without it.
+// Signing in opens SoundCloud's sign-in page in MyGo Music's built-in window
+// and captures oauth_token + oauth_refresh_token automatically; pasting cookies
+// in the plugin settings remains available as an optional fallback. The public
+// catalog works without signing in.
 //
-// SoundCloud serves audio as HLS, which the app cannot decode, so ffmpeg turns
-// it into MP3 on the fly and serves it on 127.0.0.1. Tracks whose only streams
-// are Widevine/PlayReady encrypted cannot be played and are marked unavailable.
+// SoundCloud serves audio as HLS, which the app cannot decode directly. The
+// plugin ships a lightweight Go HLS helper (bin/hls-helper) that unwraps fMP4
+// AAC / MP3 / MPEG-TS segments onto 127.0.0.1 without re-encoding. Tracks whose
+// only streams are Widevine/PlayReady encrypted cannot be played and are marked
+// unavailable.
 //
 // Everything the app shows is English text passed through host.t, which answers
 // the translation in locales/zh-CN.json when the listener reads Chinese.
 
 const API = "https://api-v2.soundcloud.com";
 const AUTH = "https://api-auth.soundcloud.com";
+const SECURE = "https://secure.soundcloud.com";
 const SITE = "https://soundcloud.com";
+const MOBI = "https://m.soundcloud.com";
 const LRCLIB = "https://lrclib.net";
+const MOBI_CLIENT_ID_FALLBACK = "KKzJxmw11tYpCs6T24P4uUYhqmjalG6M";
+const ANDROID_WEB_AUTH_APP_ID = "3152";
 
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+const BROWSER_UA =
+  host.platform === "darwin"
+    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
 
 const PAGE = 20;
 const CLIENT_ID_TTL = 24 * 60 * 60 * 1000;
 const TRACK_TTL = 5 * 60 * 1000;
 const MEDIA_TTL = 30 * 60 * 1000;
 const HISTORY_MAX = 50;
+const TOKEN_REFRESH_MARGIN = 5 * 60 * 1000;
+const REFRESH_MIN_DELAY = 5 * 1000;
+const REFRESH_MAX_DELAY = 6 * 60 * 60 * 1000;
+const REFRESH_RETRY_BASE = 60 * 1000;
+const REFRESH_RETRY_MAX = 10 * 60 * 1000;
 
 const t = host.t;
 
@@ -54,24 +72,165 @@ function token() {
   return host.storage.get("token") || "";
 }
 
+function refreshToken() {
+  return host.storage.get("refreshToken") || "";
+}
+
+function hasSession() {
+  return !!(token() || refreshToken());
+}
+
 function requireToken() {
-  if (!token()) throw fail("signIn", t("Sign in with your oauth_token first"));
+  if (!hasSession()) throw fail("signIn", t("Sign in with your oauth_token first"));
+}
+
+const BASE64_CHARS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Pure-JS base64 encoder so state encoding works in runtimes without btoa.
+function encodeBase64(input) {
+  const bytes = [];
+  const encoded = encodeURIComponent(String(input || ""));
+  for (let i = 0; i < encoded.length; i++) {
+    if (encoded[i] === "%") {
+      bytes.push(parseInt(encoded.slice(i + 1, i + 3), 16));
+      i += 2;
+    } else {
+      bytes.push(encoded.charCodeAt(i));
+    }
+  }
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i];
+    const hasB = i + 1 < bytes.length;
+    const hasC = i + 2 < bytes.length;
+    const b = hasB ? bytes[i + 1] : 0;
+    const c = hasC ? bytes[i + 2] : 0;
+    const n = (a << 16) | (b << 8) | c;
+    out += BASE64_CHARS[(n >> 18) & 63];
+    out += BASE64_CHARS[(n >> 12) & 63];
+    out += hasB ? BASE64_CHARS[(n >> 6) & 63] : "=";
+    out += hasC ? BASE64_CHARS[n & 63] : "=";
+  }
+  return out;
+}
+
+function randomBase64Url(length) {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let out = "";
+  for (let i = 0; i < length; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+function randomDeviceId() {
+  const part = () => String(100000 + Math.floor(Math.random() * 900000));
+  return `${part()}-${part()}-${part()}-${part()}`;
+}
+
+// Pure-JS base64url decoder so JWT inspection works in runtimes without atob.
+function decodeBase64Url(input) {
+  let str = String(input || "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .replace(/\s+/g, "");
+  const mod = str.length % 4;
+  if (mod === 1) return "";
+  if (mod > 0) str += "=".repeat(4 - mod);
+
+  const bytes = [];
+  for (let i = 0; i < str.length; i += 4) {
+    const a = BASE64_CHARS.indexOf(str[i]);
+    const b = BASE64_CHARS.indexOf(str[i + 1]);
+    const c = str[i + 2] === "=" ? 0 : BASE64_CHARS.indexOf(str[i + 2]);
+    const d = str[i + 3] === "=" ? 0 : BASE64_CHARS.indexOf(str[i + 3]);
+    if (a < 0 || b < 0 || c < 0 || d < 0) return "";
+    const n = (a << 18) | (b << 12) | (c << 6) | d;
+    bytes.push((n >> 16) & 255);
+    if (str[i + 2] !== "=") bytes.push((n >> 8) & 255);
+    if (str[i + 3] !== "=") bytes.push(n & 255);
+  }
+
+  let pct = "";
+  for (let i = 0; i < bytes.length; i++) {
+    pct += "%" + bytes[i].toString(16).padStart(2, "0");
+  }
+  try {
+    return decodeURIComponent(pct);
+  } catch {
+    return String.fromCharCode(...bytes);
+  }
+}
+
+function decodeJwtPayload(raw) {
+  const parts = String(raw || "").split(".");
+  if (parts.length !== 3 || !parts[1]) return null;
+  const decoded = decodeBase64Url(parts[1]);
+  if (!decoded) return null;
+  try {
+    const parsed = JSON.parse(decoded);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function jwtExpiryMs(raw) {
+  const payload = decodeJwtPayload(raw);
+  const exp = payload && Number(payload.exp);
+  return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
+}
+
+function jwtClientId(raw) {
+  const payload = decodeJwtPayload(raw);
+  return payload && typeof payload.client_id === "string"
+    ? payload.client_id.trim()
+    : "";
+}
+
+function stripQuotes(value) {
+  const trimmed = String(value || "").trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function extractCookieFromHeader(raw, name) {
+  const value = String(raw || "").trim();
+  if (!value || !value.includes("=")) return "";
+  // Supports raw Cookie headers ("Cookie: a=1; b=2"), DevTools "Copy as cURL"
+  // (bash/cmd), and "Copy as fetch" snippets without matching partial names.
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `(?:^|[;\\s'"\`^:])${escaped}=([^;\\r\\n'"\`^]+)`,
+  );
+  const match = value.match(pattern);
+  return match ? stripQuotes(match[1]) : "";
 }
 
 // A pasted value can be the token itself, `oauth_token=...`, or a full Cookie
 // header copied from the developer tools.
 function readToken(raw) {
-  let value = String(raw || "").trim();
+  let value = stripQuotes(raw);
   if (!value) return "";
   if (/^OAuth\s+/i.test(value)) value = value.replace(/^OAuth\s+/i, "").trim();
-  if (value.includes("=") || value.includes(";")) {
-    for (const part of value.split(";")) {
-      const at = part.indexOf("=");
-      if (at < 0) continue;
-      if (part.slice(0, at).trim() === "oauth_token")
-        return part.slice(at + 1).trim();
-    }
-  }
+  const fromCookie = extractCookieFromHeader(value, "oauth_token");
+  if (fromCookie) return fromCookie;
+  return value;
+}
+
+function readRefreshToken(raw) {
+  const value = stripQuotes(raw);
+  if (!value) return "";
+  const fromCookie = extractCookieFromHeader(value, "oauth_refresh_token");
+  if (fromCookie) return fromCookie;
   return value;
 }
 
@@ -126,13 +285,22 @@ function apiUrl(path, clientId, query) {
 
 async function api(path, options = {}) {
   const query = { ...(options.query || {}) };
-  let refreshClientId = false;
+  const useAuth = options.auth !== false;
+  let forceClientId = false;
+  let triedClientIdRefresh = false;
+  let triedTokenRefresh = false;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const clientId = await clientIdValue(refreshClientId);
+  if (useAuth && hasSession()) {
+    await ensureFreshToken();
+  }
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const clientId = await clientIdValue(forceClientId);
+    forceClientId = false;
+
+    const usedToken = useAuth ? token() : "";
     const headers = {};
-    if (options.auth !== false && token())
-      headers.Authorization = "OAuth " + token();
+    if (usedToken) headers.Authorization = "OAuth " + usedToken;
     if (options.body !== undefined)
       headers["content-type"] = "application/json";
     const body =
@@ -144,17 +312,30 @@ async function api(path, options = {}) {
       body,
     });
 
-    if (response.status === 401 && attempt === 0) {
-      // Either the client id or the token is stale. A fresh client id tells
-      // them apart: with a good one, a second 401 is the token.
-      refreshClientId = true;
-      continue;
-    }
-
     if (response.status === 401) {
-      if (token()) {
-        host.storage.remove("token");
-        meCache = null;
+      // Another concurrent call may already have rotated the access token while
+      // this request was in flight. Retry immediately with the new token.
+      if (useAuth && usedToken && token() && token() !== usedToken) {
+        continue;
+      }
+
+      // Rule out a stale client id before consuming the single-use refresh token.
+      if (!triedClientIdRefresh) {
+        triedClientIdRefresh = true;
+        forceClientId = true;
+        continue;
+      }
+
+      // With a fresh client id, a 401 means the access token expired or was
+      // revoked. Try refreshing it once when a refresh token is stored.
+      if (useAuth && usedToken && !triedTokenRefresh && refreshToken()) {
+        triedTokenRefresh = true;
+        const refreshed = await refreshAccessToken(usedToken);
+        if (refreshed) continue;
+      }
+
+      if (useAuth && usedToken) {
+        if (token() === usedToken) clearSession();
         throw fail(
           "signIn",
           t(
@@ -190,6 +371,7 @@ async function api(path, options = {}) {
 // Client id
 
 let clientIdCache = "";
+let clientIdPromise = null;
 
 async function clientIdValue(force = false) {
   if (!force && clientIdCache) return clientIdCache;
@@ -203,11 +385,19 @@ async function clientIdValue(force = false) {
     }
   }
 
-  const found = await scrapeClientId();
-  clientIdCache = found;
-  host.storage.set("clientId", found);
-  host.storage.set("clientIdAt", Date.now());
-  return found;
+  if (clientIdPromise) return clientIdPromise;
+
+  clientIdPromise = (async () => {
+    const found = await scrapeClientId();
+    clientIdCache = found;
+    host.storage.set("clientId", found);
+    host.storage.set("clientIdAt", Date.now());
+    return found;
+  })().finally(() => {
+    clientIdPromise = null;
+  });
+
+  return clientIdPromise;
 }
 
 async function scrapeClientId() {
@@ -261,9 +451,261 @@ async function scrapeClientId() {
 }
 
 // ---------------------------------------------------------------------------
-// Session
+// Session and token refresh
 
 let meCache = null;
+let sessionGen = 0;
+let refreshPromise = null;
+let refreshTimer = null;
+let refreshRetryCount = 0;
+let likedCursor = null;
+
+function tokenExpiresAt() {
+  const stored = Number(host.storage.get("tokenExpiresAt") || 0);
+  if (Number.isFinite(stored) && stored > 0) return stored;
+  const fromJwt = jwtExpiryMs(token());
+  if (fromJwt > 0) {
+    host.storage.set("tokenExpiresAt", fromJwt);
+    return fromJwt;
+  }
+  return 0;
+}
+
+function computeExpiresAt(accessToken, expiresIn) {
+  const fromJwt = jwtExpiryMs(accessToken);
+  if (fromJwt > 0) return fromJwt;
+  const seconds = Number(expiresIn);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Date.now() + seconds * 1000;
+  }
+  return 0;
+}
+
+function isTokenExpiringSoon(margin = TOKEN_REFRESH_MARGIN) {
+  const exp = tokenExpiresAt();
+  return exp > 0 && Date.now() >= exp - margin;
+}
+
+function isTokenExpired() {
+  const exp = tokenExpiresAt();
+  return exp > 0 && Date.now() >= exp;
+}
+
+function clearRefreshTimer() {
+  if (refreshTimer !== null) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+function clearSession() {
+  sessionGen += 1;
+  refreshRetryCount = 0;
+  clearRefreshTimer();
+  host.storage.remove("token");
+  host.storage.remove("refreshToken");
+  host.storage.remove("tokenExpiresAt");
+  meCache = null;
+  likedCursor = null;
+}
+
+function saveSession({ accessToken, refreshToken: nextRefresh, expiresIn }) {
+  host.storage.set("token", accessToken);
+  if (nextRefresh) {
+    host.storage.set("refreshToken", nextRefresh);
+  }
+  const expiresAt = computeExpiresAt(accessToken, expiresIn);
+  if (expiresAt > 0) {
+    host.storage.set("tokenExpiresAt", expiresAt);
+  } else {
+    host.storage.remove("tokenExpiresAt");
+  }
+  refreshRetryCount = 0;
+  scheduleRefresh();
+}
+
+function scheduleRefresh(overrideDelayMs) {
+  clearRefreshTimer();
+  if (!refreshToken() || !token()) return;
+
+  let delay = overrideDelayMs;
+  if (delay === undefined) {
+    const exp = tokenExpiresAt();
+    if (!exp) return;
+    delay = Math.max(
+      REFRESH_MIN_DELAY,
+      Math.min(REFRESH_MAX_DELAY, exp - TOKEN_REFRESH_MARGIN - Date.now()),
+    );
+  }
+
+  const gen = sessionGen;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    if (gen !== sessionGen || !refreshToken()) return;
+    refreshAccessToken().catch((error) => {
+      if (gen !== sessionGen) return;
+      if (error && error.code === "signIn") return;
+      // Keep the session on transient network/server errors and retry with backoff.
+      refreshRetryCount += 1;
+      const backoff = Math.min(
+        REFRESH_RETRY_MAX,
+        REFRESH_RETRY_BASE * Math.pow(2, Math.min(refreshRetryCount - 1, 4)),
+      );
+      scheduleRefresh(backoff);
+    });
+  }, delay);
+}
+
+// Exchanges a single-use refresh token at secure.soundcloud.com/oauth/token.
+// SoundCloud binds web refresh tokens to the issuing client_id, which is
+// carried in the JWT oauth_token when present.
+async function requestTokenRefresh(rt, currentAccessToken) {
+  if (!rt) {
+    return {
+      ok: false,
+      permanent: false,
+      error: t("Missing refresh token"),
+    };
+  }
+
+  const tryExchange = async (clientId) => {
+    const body = new URLSearchParams({
+      client_id: clientId,
+      grant_type: "refresh_token",
+      refresh_token: rt,
+    }).toString();
+
+    return request(`${SECURE}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      },
+      body,
+    });
+  };
+
+  let clientId = jwtClientId(currentAccessToken) || (await clientIdValue(false));
+  let response = await tryExchange(clientId);
+
+  // If the client_id itself was rejected, scrape a fresh web client_id and
+  // retry once. invalid_client fails before the refresh token is consumed.
+  if (
+    response.status === 401 &&
+    response.data &&
+    response.data.error === "invalid_client"
+  ) {
+    const freshClientId = await clientIdValue(true);
+    if (freshClientId && freshClientId !== clientId) {
+      clientId = freshClientId;
+      response = await tryExchange(clientId);
+    }
+  }
+
+  if (response.status === 200 && response.data && response.data.access_token) {
+    return { ok: true, permanent: false, status: 200, data: response.data };
+  }
+
+  const errCode =
+    response.data && typeof response.data.error === "string"
+      ? response.data.error
+      : "";
+  const permanent =
+    (response.status === 400 &&
+      (errCode === "invalid_grant" || errCode === "invalid_token")) ||
+    response.status === 401;
+
+  const message =
+    (response.data &&
+      (response.data.error_description || response.data.error)) ||
+    `${t("SoundCloud answered")} ${response.status}`;
+
+  return {
+    ok: false,
+    permanent,
+    status: response.status,
+    error: String(message),
+  };
+}
+
+// Single-flight refresh lock: SoundCloud refresh tokens are single-use, so
+// concurrent requests must share one refresh call instead of racing.
+async function refreshAccessToken(failedToken = "") {
+  if (failedToken && token() && token() !== failedToken) {
+    return token();
+  }
+  if (refreshPromise) return refreshPromise;
+
+  const gen = sessionGen;
+  refreshPromise = (async () => {
+    if (failedToken && token() && token() !== failedToken) {
+      return token();
+    }
+
+    const rt = refreshToken();
+    if (!rt) return "";
+
+    const result = await requestTokenRefresh(rt, token());
+
+    // Ignore the response if the user signed out or changed settings meanwhile.
+    if (gen !== sessionGen) return "";
+
+    if (result.ok) {
+      saveSession({
+        accessToken: result.data.access_token,
+        refreshToken: result.data.refresh_token || rt,
+        expiresIn: result.data.expires_in,
+      });
+      return result.data.access_token;
+    }
+
+    if (result.permanent) {
+      clearSession();
+      throw fail(
+        "signIn",
+        t(
+          "Your SoundCloud session expired: paste a new oauth_token and oauth_refresh_token in the settings",
+        ),
+      );
+    }
+
+    throw new Error(result.error || t("Could not refresh SoundCloud session"));
+  })().finally(() => {
+    refreshPromise = null;
+  });
+
+  return refreshPromise;
+}
+
+async function ensureFreshToken() {
+  if (!refreshToken()) return;
+  if (token() && !isTokenExpiringSoon()) return;
+
+  try {
+    await refreshAccessToken();
+  } catch (error) {
+    if (error && error.code === "signIn") throw error;
+    // If the current token has not actually expired yet, allow the request to
+    // proceed despite a transient refresh failure.
+    if (token() && !isTokenExpired()) return;
+    throw error;
+  }
+}
+
+async function validateConnectSession(accessToken) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const clientId = await clientIdValue(attempt > 0);
+    const response = await request(
+      `${AUTH}/connect/session?client_id=${encodeURIComponent(clientId)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session: { access_token: accessToken } }),
+      },
+    );
+    if (response.status === 200) return true;
+  }
+  return false;
+}
 
 async function meNow() {
   if (meCache) return meCache;
@@ -277,52 +719,169 @@ async function meNow() {
   return meCache;
 }
 
+let mobiClientIdCache = "";
+
+async function mobiClientIdValue() {
+  if (mobiClientIdCache) return mobiClientIdCache;
+  try {
+    const response = await request(`${MOBI}/signin`, {
+      headers: { accept: "text/html" },
+    });
+    if (response.status === 200) {
+      const found =
+        response.text.match(/"clientId"\s*:\s*"([0-9a-zA-Z]{32})"/) ||
+        response.text.match(/client_id["']?\s*:\s*["']([0-9a-zA-Z]{32})["']/);
+      if (found) {
+        mobiClientIdCache = found[1];
+        return mobiClientIdCache;
+      }
+    }
+  } catch {
+    // Fall back to the known mobile web client id.
+  }
+  return MOBI_CLIENT_ID_FALLBACK;
+}
+
+// Builds a top-level secure.soundcloud.com/web-auth URL that runs third-party
+// providers (Google, Apple, Facebook) via same-window redirect instead of
+// window.open popups (which embedded WebViews block), then bounces through
+// m.soundcloud.com/signin/callback onto soundcloud.com so SoundCloud's own web
+// bootstrap mints oauth_token + HttpOnly oauth_refresh_token cookies.
+async function buildWebSignInUrl() {
+  const mobiClientId = await mobiClientIdValue();
+  const nonce = randomBase64Url(24);
+  const state = encodeBase64(
+    JSON.stringify({
+      origin: SITE,
+      path: "/discover",
+      client_id: mobiClientId,
+      nonce,
+    }),
+  );
+  const params = new URLSearchParams({
+    client_id: mobiClientId,
+    device_id: randomDeviceId(),
+    origin: MOBI,
+    app_id: ANDROID_WEB_AUTH_APP_ID,
+    redirect_uri: `${MOBI}/signin/callback`,
+    response_type: "code",
+    code_challenge: randomBase64Url(43),
+    code_challenge_method: "S256",
+    state,
+    stand_alone: "true",
+  });
+  return `${SECURE}/web-auth?${params.toString()}`;
+}
+
 export async function signIn() {
-  const pasted = readToken(host.setting("oauthToken"));
-  if (!pasted)
-    throw fail(
-      "setup",
-      t("Paste your oauth_token in the plugin settings, then sign in"),
-    );
+  const rawToken = host.setting("oauthToken");
+  const rawRefresh = host.setting("oauthRefreshToken");
+  let access = readToken(rawToken);
+  let refresh =
+    readRefreshToken(rawRefresh) ||
+    extractCookieFromHeader(rawToken, "oauth_refresh_token");
+  let fromWebSignIn = false;
 
-  let accepted = false;
-  for (let attempt = 0; attempt < 2 && !accepted; attempt++) {
-    const clientId = await clientIdValue(attempt > 0);
-    const response = await request(
-      `${AUTH}/connect/session?client_id=${encodeURIComponent(clientId)}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ session: { access_token: pasted } }),
-      },
-    );
-    accepted = response.status === 200;
-  }
-
-  if (!accepted) {
-    throw fail("signIn", t("SoundCloud rejected that oauth_token"));
-  }
-
-  host.storage.set("token", pasted);
+  const gen = ++sessionGen;
+  clearRefreshTimer();
   meCache = null;
+  likedCursor = null;
+
+  if (!access && !refresh) {
+    if (typeof host.webSignIn !== "function") {
+      throw fail(
+        "setup",
+        t("Paste your oauth_token in the plugin settings, then sign in"),
+      );
+    }
+
+    const authUrl = await buildWebSignInUrl();
+
+    // Request cookies for /n/api/refresh-token so both Path=/ (oauth_token) and
+    // path-scoped HttpOnly refresh cookies (oauth_refresh_token) are captured.
+    const result = await host.webSignIn({
+      url: authUrl,
+      cookiesOf: `${SITE}/n/api/refresh-token`,
+      until: ["oauth_token"],
+      userAgent: BROWSER_UA,
+    });
+    const cookieHeader = (result && result.cookie) || "";
+    access = extractCookieFromHeader(cookieHeader, "oauth_token");
+    refresh = extractCookieFromHeader(cookieHeader, "oauth_refresh_token");
+    fromWebSignIn = true;
+
+    if (!access) {
+      throw fail(
+        "signIn",
+        t("SoundCloud sign-in did not return a session: try again"),
+      );
+    }
+  }
+
+  let expiresIn = 0;
+  let needsRefresh = !access;
+
+  if (access && !fromWebSignIn) {
+    const exp = jwtExpiryMs(access);
+    if (exp > 0 && Date.now() >= exp && refresh) {
+      needsRefresh = true;
+    } else {
+      const accepted = await validateConnectSession(access);
+      if (!accepted) {
+        if (refresh) {
+          needsRefresh = true;
+        } else {
+          throw fail("signIn", t("SoundCloud rejected that oauth_token"));
+        }
+      }
+    }
+  }
+
+  if (needsRefresh) {
+    const refreshed = await requestTokenRefresh(refresh, access);
+    if (!refreshed.ok) {
+      if (refreshed.permanent) {
+        throw fail(
+          "signIn",
+          t("SoundCloud rejected that oauth_refresh_token"),
+        );
+      }
+      throw new Error(
+        refreshed.error || t("Could not refresh SoundCloud session"),
+      );
+    }
+    access = refreshed.data.access_token;
+    if (refreshed.data.refresh_token) refresh = refreshed.data.refresh_token;
+    expiresIn = Number(refreshed.data.expires_in) || 0;
+  }
+
+  if (gen !== sessionGen) {
+    throw fail("signIn", t("Sign-in was interrupted"));
+  }
+
+  saveSession({ accessToken: access, refreshToken: refresh, expiresIn });
 
   try {
     const me = await meNow();
     return { id: me.id, name: me.name, imageUrl: me.imageUrl, page: "me" };
-  } catch {
-    host.storage.remove("token");
-    meCache = null;
-    throw fail("signIn", t("SoundCloud rejected that oauth_token"));
+  } catch (error) {
+    clearSession();
+    if (error && error.code === "signIn") throw error;
+    throw fail(
+      "signIn",
+      fromWebSignIn
+        ? t("SoundCloud did not accept that sign-in: try again")
+        : t("SoundCloud rejected that oauth_token"),
+    );
   }
 }
 
 export function signOut() {
-  host.storage.remove("token");
-  meCache = null;
+  clearSession();
 }
 
 export async function account() {
-  if (!token()) return null;
+  if (!hasSession()) return null;
   try {
     const me = await meNow();
     return { id: me.id, name: me.name, imageUrl: me.imageUrl, page: "me" };
@@ -331,13 +890,28 @@ export async function account() {
   }
 }
 
-export function setSetting({ key }) {
+export function setSetting({ key, value }) {
   // A new token replaces the old session; signing in validates the new one.
   if (key === "oauthToken") {
-    host.storage.remove("token");
-    meCache = null;
+    clearSession();
+    return;
+  }
+  if (key === "oauthRefreshToken" && hasSession()) {
+    const raw =
+      value !== undefined ? value : host.setting("oauthRefreshToken");
+    const rt = readRefreshToken(raw);
+    if (rt) {
+      host.storage.set("refreshToken", rt);
+      scheduleRefresh();
+    } else {
+      host.storage.remove("refreshToken");
+      clearRefreshTimer();
+    }
   }
 }
+
+// Resume proactive background refresh when the plugin loads with a saved session.
+scheduleRefresh();
 
 // ---------------------------------------------------------------------------
 // Mapping SoundCloud to what the app shows
@@ -602,7 +1176,7 @@ async function selectionPlaylists(limit) {
 export async function home() {
   const sections = [];
 
-  if (token()) {
+  if (hasSession()) {
     const me = await meNow().catch(() => null);
 
     if (me) {
@@ -825,7 +1399,7 @@ export async function suggest({ query }) {
 // Library
 
 export async function playlists() {
-  if (!token()) return [];
+  if (!hasSession()) return [];
   const me = await meNow();
 
   const [mine, likes] = await Promise.allSettled([
@@ -911,13 +1485,50 @@ export async function artist({ id }) {
 export async function liked({ offset = 0 } = {}) {
   requireToken();
   const me = await meNow();
-  const response = await api(`/users/${me.id}/track_likes`, {
-    query: { limit: PAGE, offset, linked_partitioning: 1 },
-  });
+
+  // SoundCloud's /users/:id/track_likes uses opaque timestamp cursors in
+  // next_href and rejects numeric offsets > 0 with 400 (ChronoParams.Cursor).
+  let response;
+  if (offset <= 0) {
+    likedCursor = null;
+    response = await api(`/users/${me.id}/track_likes`, {
+      query: { limit: PAGE, linked_partitioning: 1 },
+    });
+  } else if (likedCursor && Math.abs(offset - likedCursor.at) <= 5) {
+    response = await api(likedCursor.href);
+  } else {
+    const all = [];
+    let nextPath = `/users/${me.id}/track_likes`;
+    let query = { limit: 50, linked_partitioning: 1 };
+    for (
+      let page = 0;
+      page < 20 && nextPath && all.length < offset + PAGE;
+      page++
+    ) {
+      const batch = await api(nextPath, { query });
+      for (const item of batch.collection || []) {
+        const mapped = toTrack(item.track);
+        if (mapped) all.push(mapped);
+      }
+      nextPath = batch.next_href || "";
+      query = undefined;
+    }
+    const tracks = all.slice(offset, offset + PAGE);
+    likedCursor =
+      nextPath && all.length >= offset + PAGE
+        ? { at: all.length, href: nextPath }
+        : null;
+    return { tracks, more: all.length > offset + PAGE || !!nextPath };
+  }
+
   const tracks = (response.collection || [])
     .map((item) => toTrack(item.track))
     .filter(Boolean);
-  return { tracks, more: hasMore(response, tracks.length) };
+  const nextHref = response.next_href || "";
+  likedCursor = nextHref
+    ? { at: offset + tracks.length, href: nextHref }
+    : null;
+  return { tracks, more: !!nextHref };
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +1538,7 @@ export async function recent() {
   const local = load("history", []);
   let remote = [];
 
-  if (token()) {
+  if (hasSession()) {
     try {
       const response = await api("/me/play-history/tracks", {
         query: { limit: 50, linked_partitioning: 1 },
@@ -965,7 +1576,7 @@ const lyricCache = new Map();
 
 async function lrclib(path) {
   const response = await request(LRCLIB + path, {
-    headers: { "user-agent": "mygo-soundcloud/0.1.0 (MyGo Music plugin)" },
+    headers: { "user-agent": "mygo-soundcloud/0.1.2 (MyGo Music plugin)" },
   });
   if (response.status === 404) return null;
   if (response.status !== 200) return null;
@@ -1117,41 +1728,140 @@ export async function lyrics({ id }) {
 // ---------------------------------------------------------------------------
 // Playing
 
-const processes = [];
-const servingAtMost = 3;
-const servedWithin = 10 * 60 * 1000;
-const foundPrograms = {};
+let helperProc = null;
+let helperPort = 0;
+let helperStarting = null;
+let helperMissing = false;
 
-function stopWaiting() {
-  while (processes.length >= servingAtMost) processes.shift().kill();
+function helperCandidates() {
+  const ext = host.platform === "windows" ? ".exe" : "";
+  const list = [`bin/hls-helper${ext}`];
+  if (host.platform && host.arch) {
+    list.unshift(`bin/hls-helper-${host.platform}-${host.arch}${ext}`);
+  }
+  return list;
 }
 
-async function program(name, versionFlag) {
-  if (foundPrograms[name]) return foundPrograms[name];
+async function readLineWithTimeout(proc, ms) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      proc.readLine(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("helper startup timeout")), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
 
-  const places = [name, `/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`];
-  for (const path of places) {
-    try {
-      const proc = host.spawn(path, [versionFlag]);
-      proc.closeStdin();
-      while ((await proc.readLine()) !== null) {
-        // Drain it.
-      }
-      if ((await proc.wait()) === 0) {
-        foundPrograms[name] = path;
-        return path;
-      }
-    } catch (error) {
-      if (/allowed/.test(error.message)) {
-        throw fail(
-          "setup",
-          t("Allow SoundCloud to start programs in its settings"),
-        );
+async function startHelper() {
+  if (helperProc && helperPort) return helperPort;
+  if (helperMissing) return 0;
+  if (helperStarting) return helperStarting;
+
+  helperStarting = (async () => {
+    for (const path of helperCandidates()) {
+      let proc = null;
+      try {
+        proc = host.spawn(path, []);
+        const line = await readLineWithTimeout(proc, 5000);
+        if (!line) {
+          try {
+            proc.kill();
+          } catch {
+            // already exited
+          }
+          continue;
+        }
+        const info = JSON.parse(line);
+        const port = Number(info && info.port);
+        if (!Number.isInteger(port) || port <= 0) {
+          try {
+            proc.kill();
+          } catch {
+            // ignore
+          }
+          continue;
+        }
+        helperProc = proc;
+        helperPort = port;
+        proc.wait().then(() => {
+          if (helperProc === proc) {
+            helperProc = null;
+            helperPort = 0;
+          }
+        });
+        return port;
+      } catch (error) {
+        if (proc) {
+          try {
+            proc.kill();
+          } catch {
+            // ignore
+          }
+        }
+        if (error && /allowed/.test(error.message)) {
+          throw fail(
+            "setup",
+            t("Allow SoundCloud to start programs in its settings"),
+          );
+        }
       }
     }
-  }
+    helperMissing = true;
+    return 0;
+  })().finally(() => {
+    helperStarting = null;
+  });
 
-  return null;
+  return helperStarting;
+}
+
+async function serveWithHelper(playlist) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const port = await startHelper();
+    if (!port) {
+      throw fail(
+        "setup",
+        t(
+          "SoundGo's built-in HLS helper is missing: reinstall the platform release ZIP",
+        ),
+      );
+    }
+
+    try {
+      const response = await request(`http://127.0.0.1:${port}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: playlist }),
+      });
+      if (response.status === 200 && response.data && response.data.url) {
+        return {
+          url: response.data.url,
+          type: response.data.type || "aac",
+        };
+      }
+      const reason =
+        (response.data && response.data.error) ||
+        t("SoundCloud did not give out a stream for this track");
+      throw fail("unavailable", String(reason));
+    } catch (error) {
+      if (error && error.code) throw error;
+      // Helper may have exited; reset and retry spawning once.
+      if (helperProc) {
+        try {
+          helperProc.kill();
+        } catch {
+          // ignore
+        }
+      }
+      helperProc = null;
+      helperPort = 0;
+    }
+  }
+  throw new Error(t("The audio did not start"));
 }
 
 function pickTranscoding(track) {
@@ -1185,78 +1895,6 @@ async function resolveMedia(track, transcoding) {
   return response.url;
 }
 
-async function serve(playlist, kbps) {
-  const ffmpeg = await program("ffmpeg", "-version");
-  if (!ffmpeg) {
-    throw fail(
-      "setup",
-      t(
-        "SoundCloud plays through ffmpeg: install it with Homebrew, or so that it is on the PATH",
-      ),
-    );
-  }
-
-  stopWaiting();
-  const port = 20000 + Math.floor(Math.random() * 40000);
-  const proc = host.spawn(ffmpeg, [
-    "-nostdin",
-    "-hide_banner",
-    "-nostats",
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_delay_max",
-    "5",
-    "-rw_timeout",
-    "15000000",
-    "-i",
-    playlist,
-    "-vn",
-    "-c:a",
-    "libmp3lame",
-    "-b:a",
-    `${kbps}k`,
-    "-id3v2_version",
-    "0",
-    "-write_xing",
-    "0",
-    "-f",
-    "mp3",
-    "-listen",
-    "1",
-    `http://127.0.0.1:${port}/`,
-  ]);
-  proc.closeStdin();
-
-  let stopped = false;
-  processes.push(proc);
-  const timer = setTimeout(() => proc.kill(), servedWithin);
-
-  proc.wait().then(() => {
-    stopped = true;
-    clearTimeout(timer);
-    const at = processes.indexOf(proc);
-    if (at >= 0) processes.splice(at, 1);
-  });
-
-  const until = Date.now() + 15000;
-  while (!proc.errorOutput().includes("Input #0")) {
-    if (stopped) {
-      const said = proc.errorOutput().trim().split("\n").pop() || "";
-      throw new Error(`${t("The audio did not start")}: ${said}`);
-    }
-    if (Date.now() > until) {
-      proc.kill();
-      throw new Error(t("The audio did not start in time"));
-    }
-    await sleep(30);
-  }
-
-  await sleep(100);
-  return `http://127.0.0.1:${port}/`;
-}
-
 export async function stream({ id, quality }) {
   const track = await rawTrack(id);
   const transcoding = pickTranscoding(track);
@@ -1283,13 +1921,19 @@ export async function stream({ id, quality }) {
     return { url: media, type, quality: quality || "high" };
   }
 
-  const kbps = quality === "standard" ? 128 : 192;
-  const url = await serve(media, kbps);
-
+  const relayed = await serveWithHelper(media);
+  const presetBitRate =
+    transcoding.preset === "aac_160k"
+      ? 160000
+      : transcoding.preset === "aac_96k"
+        ? 96000
+        : transcoding.preset === "mp3_128"
+          ? 128000
+          : undefined;
   return {
-    url,
-    type: "mp3",
+    url: relayed.url,
+    type: relayed.type,
     quality: quality === "standard" ? "standard" : "high",
-    bitRate: kbps * 1000,
+    ...(presetBitRate ? { bitRate: presetBitRate } : {}),
   };
 }

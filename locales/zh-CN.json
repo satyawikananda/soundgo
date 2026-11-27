@@ -1,8 +1,6 @@
 {
   "SoundGo": "SoundGo",
   "SoundCloud": "SoundCloud",
-  "oauth_token cookie": "oauth_token Cookie",
-  "Sign in at soundcloud.com, open the browser's developer tools, then copy the oauth_token cookie from Application > Cookies. Paste it here and click Sign In.": "在 soundcloud.com 登录，打开浏览器的开发者工具，从 Application > Cookies 复制 oauth_token Cookie，粘贴到此处并点击登录。",
   "Charts": "排行榜",
   "Following": "关注",
   "Your Stream": "你的动态",
@@ -21,6 +19,13 @@
   "Single": "单曲",
   "Sign in with your oauth_token first": "请先用 oauth_token 登录",
   "Your oauth_token stopped working: paste a new one in the settings": "oauth_token 已失效，请在设置中粘贴新的 token",
+  "Your SoundCloud session expired: paste a new oauth_token and oauth_refresh_token in the settings": "SoundCloud 登录已过期，请在设置中粘贴新的 oauth_token 和 oauth_refresh_token",
+  "Missing refresh token": "缺少 refresh token",
+  "Could not refresh SoundCloud session": "无法刷新 SoundCloud 登录状态",
+  "SoundCloud rejected that oauth_refresh_token": "SoundCloud 拒绝了这个 oauth_refresh_token",
+  "SoundCloud sign-in did not return a session: try again": "SoundCloud 登录未返回有效会话，请重试",
+  "SoundCloud did not accept that sign-in: try again": "SoundCloud 未接受本次登录，请重试",
+  "Sign-in was interrupted": "登录已中断",
   "SoundCloud rejected the request": "SoundCloud 拒绝了这个请求",
   "SoundCloud has nothing at that address": "SoundCloud 上没有这个地址",
   "SoundCloud will not play this": "SoundCloud 不允许播放这个",
@@ -32,8 +37,7 @@
   "SoundCloud rejected that oauth_token": "SoundCloud 拒绝了这个 oauth_token",
   "Allow SoundCloud to start programs in its settings": "请在插件设置中允许 SoundCloud 启动程序",
   "SoundCloud did not give out a stream for this track": "SoundCloud 没有为这首歌提供音频流",
-  "SoundCloud plays through ffmpeg: install it with Homebrew, or so that it is on the PATH": "SoundCloud 通过 ffmpeg 播放：请用 Homebrew 安装，或让它位于 PATH 中",
+  "SoundGo's built-in HLS helper is missing: reinstall the platform release ZIP": "缺少 SoundGo 内置 HLS 播放组件，请重新安装对应平台的 Release ZIP",
   "The audio did not start": "音频没有开始播放",
-  "The audio did not start in time": "音频没有及时开始播放",
   "This track is encrypted with DRM, so SoundCloud will not let a plugin play it": "这首歌使用 DRM 加密，SoundCloud 不允许插件播放"
 }
